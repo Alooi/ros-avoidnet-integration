@@ -4,7 +4,7 @@ from torchvision.transforms import Compose, Resize, ToTensor, Normalize
 from PIL import Image
 import numpy as np
 
-from depth_anything.dpt import DepthAnything
+from .depth_anything.dpt import DepthAnything
 
 class DepthAnythingProcessor:
     def __init__(self, encoder='vitl', device='cuda'):

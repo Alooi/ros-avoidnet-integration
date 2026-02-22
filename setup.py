@@ -12,10 +12,10 @@ setup(
         ('share/' + package_name, ['package.xml']),
         # Explicitly include only the .pth model file in the models directory
         (os.path.join('share', package_name, 'models'), [
-            'image_processor_pkg/models/ImageReducer_bounded_grayscale_run_2.pth'
+            'image_processor_pkg/models/ImageReducer_bounded_grayscale_run_2_1.pth'
         ]),
     ],
-    install_requires=['setuptools'],
+    install_requires=['setuptools', 'torch', 'torchvision', 'opencv-python', 'Pillow', 'numpy', 'matplotlib', 'huggingface-hub'],
     zip_safe=True,
     maintainer='your_name',
     maintainer_email='your_email@example.com',
@@ -26,7 +26,7 @@ setup(
         'console_scripts': [
             # Keep the installed executable name the same so launch/ros2 run calls still work,
             # but point it to the updated module implementation.
-            'image_processor = image_processor_pkg.image_processor_updated:main',
+            'image_processor = image_processor_pkg.image_processor_3D:main',
         ],
     },
 )
