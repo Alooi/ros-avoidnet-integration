@@ -2,6 +2,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import CompressedImage, Image, Joy
+from std_msgs.msg import Bool
 import cv2
 import numpy as np
 import torch
@@ -28,6 +29,9 @@ class ImageProcessor(Node):
         self.bridge = CvBridge()
         self.threshold = threshold
         self.obstacle = 0
+
+        # Processing gate - starts disabled, enabled via /ai_processing_enable from surface laptop
+        self.processing_enabled = False
 
         # Frame throttling - critical for preventing system overload
         self.target_fps = target_fps
@@ -79,6 +83,11 @@ class ImageProcessor(Node):
         # Add a counter to track received images
         self.image_count = 0
         
+        # Subscribe to AI processing enable/disable from surface laptop (via NVR service)
+        self.create_subscription(
+            Bool, '/ai_processing_enable', self.ai_enable_callback, 10)
+        self.get_logger().info("Waiting for AI processing enable signal on /ai_processing_enable")
+
         self.subscription_joy = self.create_subscription(
             Joy, '/joy', self.joy_callback, 10)
 
@@ -106,7 +115,18 @@ class ImageProcessor(Node):
         
         self.get_logger().info(f"Node initialized with model: {arc} on {self.device} - 3D version with depth processing")
 
+    def ai_enable_callback(self, msg):
+        was_enabled = self.processing_enabled
+        self.processing_enabled = msg.data
+        if self.processing_enabled and not was_enabled:
+            self.get_logger().info("AI processing ENABLED")
+        elif not self.processing_enabled and was_enabled:
+            self.get_logger().info("AI processing DISABLED")
+
     def image_callback(self, msg):
+        if not self.processing_enabled:
+            return
+
         # Throttle: skip frames if processing too fast or already processing
         current_time = time.time()
         if self.is_processing or (current_time - self.last_process_time) < self.min_interval:
@@ -148,13 +168,13 @@ class ImageProcessor(Node):
             outputs = outputs.squeeze(0).detach().cpu().permute(1, 2, 0).numpy()
             t2 = time.time()
 
-            # Dehaze processing - DISABLED (125ms CPU bottleneck)
-            # atmospheric_light = self.dehazer.estimate_atmospheric_light(frame)
-            # color_difference_map = self.dehazer.get_color_difference_map(frame, atmospheric_light)
-            # color_difference_map_resized = cv2.resize(color_difference_map, (outputs.shape[1], outputs.shape[0]))
-            # color_difference_map_resized *= self.color_diff_scale
-            # outputs[:, :, 0] += color_difference_map_resized
-            # outputs = np.clip(outputs, 0, 1)
+            # Dehaze processing - boosts obstacle detection in turbid water
+            atmospheric_light = self.dehazer.estimate_atmospheric_light(frame)
+            color_difference_map = self.dehazer.get_color_difference_map(frame, atmospheric_light)
+            color_difference_map_resized = cv2.resize(color_difference_map, (outputs.shape[1], outputs.shape[0]))
+            color_difference_map_resized *= self.color_diff_scale
+            outputs[:, :, 0] += color_difference_map_resized
+            outputs = np.clip(outputs, 0, 1)
             t3 = time.time()
 
             # Draw obstacles on frame
@@ -266,7 +286,7 @@ def main(args=None):
         dehaze_t0=0.6,
         dehaze_atmos_factor=0.8,
         color_diff_scale=0.4,
-        target_fps=15.0  # Testing without dehaze
+        target_fps=30  # Testing with dehaze enabled
     )
     rclpy.spin(node)
     node.destroy_node()
