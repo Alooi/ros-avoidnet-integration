@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from huggingface_hub import PyTorchModelHubMixin, hf_hub_download
 
-from depth_anything.blocks import FeatureFusionBlock, _make_scratch
+from .blocks import FeatureFusionBlock, _make_scratch
 
 
 def _make_fusion_block(features, use_bn, size = None):
@@ -137,7 +137,7 @@ class DPTHead(nn.Module):
         
         
 class DPT_DINOv2(nn.Module):
-    def __init__(self, encoder='vitl', features=256, out_channels=[256, 512, 1024, 1024], use_bn=False, use_clstoken=False, localhub=True):
+    def __init__(self, encoder='vitl', features=256, out_channels=[256, 512, 1024, 1024], use_bn=False, use_clstoken=False, localhub=False):
         super(DPT_DINOv2, self).__init__()
         
         assert encoder in ['vits', 'vitb', 'vitl']

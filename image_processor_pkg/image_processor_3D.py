@@ -1,17 +1,17 @@
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import CompressedImage, Image, Joy
+from std_msgs.msg import Bool
 import cv2
 import numpy as np
 import torch
+import time
 from cv_bridge import CvBridge
 from PIL import Image as PILImage
 from ament_index_python.packages import get_package_share_directory
 import os
-import matplotlib
-matplotlib.use('Agg')  # Non-interactive backend for headless operation
-import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
+# Matplotlib removed - visualization now done on surface laptop
 
 # Import custom modules
 from image_processor_pkg.AvoidNet.avoid_net import get_model
@@ -23,11 +23,21 @@ from image_processor_pkg.AvoidNet3D.dehaze_class import DehazeClass
 from image_processor_pkg.AvoidNet3D.depth_anything_processor import DepthAnythingProcessor
 
 class ImageProcessor(Node):
-    def __init__(self, arc, run_name, use_gpu=False, threshold=0.5, dehaze_t0=0.6, dehaze_atmos_factor=0.8, color_diff_scale=0.5):
+    def __init__(self, arc, run_name, use_gpu=False, threshold=0.5, dehaze_t0=0.6, dehaze_atmos_factor=0.8, color_diff_scale=0.5,
+                 target_fps=2.0):
         super().__init__('image_processor')
         self.bridge = CvBridge()
         self.threshold = threshold
         self.obstacle = 0
+
+        # Processing gate - starts disabled, enabled via /ai_processing_enable from surface laptop
+        self.processing_enabled = False
+
+        # Frame throttling - critical for preventing system overload
+        self.target_fps = target_fps
+        self.min_interval = 1.0 / target_fps
+        self.last_process_time = 0.0
+        self.is_processing = False
 
         # Dynamically get the model path using get_package_share_directory
         model_path = os.path.join(
@@ -38,7 +48,7 @@ class ImageProcessor(Node):
 
         # Model setup
         self.model = get_model(arc)
-        self.model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
+        self.model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu'), weights_only=True))
         self.device = torch.device("cuda" if torch.cuda.is_available() and use_gpu else "cpu")
         self.model.to(self.device).eval()
 
@@ -57,79 +67,128 @@ class ImageProcessor(Node):
         self.dehazer = DehazeClass(t0=dehaze_t0, atmospheric_light_estimation_factor=dehaze_atmos_factor)
         self.color_diff_scale = color_diff_scale
         
-        # 3D visualization setup
-        self.fig = plt.figure(figsize=(20, 10))
-        self.ax1 = self.fig.add_subplot(131)  # Original frame
-        self.ax2 = self.fig.add_subplot(132, projection='3d')  # Depth map
-        self.ax3 = self.fig.add_subplot(133, projection='3d')  # Obstacles 3D
-
-        # Subscription to the image topic
+        # Subscription to the image topic (uncompressed AI feed from batman_camera_hw)
+        # Use BestEffort QoS to match camera publisher
+        qos_profile = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1
+        )
         self.subscription = self.create_subscription(
-            Image, '/cam1/camera/image_raw', self.image_callback, 10)
+            Image, '/local/cam1/camera/image_raw_uncompressed', self.image_callback, qos_profile)
         
-        self.get_logger().info("Subscribed to /cam1/camera/image_raw")
+        self.get_logger().info("Subscribed to /local/cam1/camera/image_raw_uncompressed")
         
         # Add a counter to track received images
         self.image_count = 0
         
+        # Subscribe to AI processing enable/disable from surface laptop (via NVR service)
+        self.create_subscription(
+            Bool, '/ai_processing_enable', self.ai_enable_callback, 10)
+        self.get_logger().info("Waiting for AI processing enable signal on /ai_processing_enable")
+
         self.subscription_joy = self.create_subscription(
             Joy, '/joy', self.joy_callback, 10)
 
-        # Publisher for the processed image
-        self.processed_image_publisher = self.create_publisher(Image, 'processed_image_topic', 80)
+        # Publisher for the processed image (use BestEffort QoS for RViz compatibility)
+        processed_image_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1
+        )
+        # Always publish compressed annotated frame
+        self.processed_image_publisher = self.create_publisher(
+            CompressedImage, '/ai/annotated_frame/compressed', processed_image_qos)
+
+        # Publish depth map as compressed image for surface visualization
+        self.depth_image_publisher = self.create_publisher(
+            CompressedImage, '/ai/depth_map/compressed', processed_image_qos)
+
+        # Publish obstacle grid as compressed image
+        self.obstacle_grid_publisher = self.create_publisher(
+            CompressedImage, '/ai/obstacle_grid/compressed', processed_image_qos)
+
         self.joy_manipulation = self.create_publisher(Joy, '/joy', 80)
 
         
         self.get_logger().info(f"Node initialized with model: {arc} on {self.device} - 3D version with depth processing")
 
+    def ai_enable_callback(self, msg):
+        was_enabled = self.processing_enabled
+        self.processing_enabled = msg.data
+        if self.processing_enabled and not was_enabled:
+            self.get_logger().info("AI processing ENABLED")
+        elif not self.processing_enabled and was_enabled:
+            self.get_logger().info("AI processing DISABLED")
+
     def image_callback(self, msg):
+        if not self.processing_enabled:
+            return
+
+        # Throttle: skip frames if processing too fast or already processing
+        current_time = time.time()
+        if self.is_processing or (current_time - self.last_process_time) < self.min_interval:
+            return  # Skip this frame to prevent backlog
+
+        self.is_processing = True
+        self.last_process_time = current_time
+
         try:
             # Convert ROS Image message to OpenCV format
             frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
             self.image_count += 1
-            
+
             # Initialize hazer model on first frame
             if self.hazer_model is None:
                 self.frame_height = frame.shape[0]
                 self.frame_width = frame.shape[1]
-                self.hazer_model = HazerDepth(show_video=False, show_graph=False, patch_size=1, 
+                self.hazer_model = HazerDepth(show_video=False, show_graph=False, patch_size=1,
                                             H=self.frame_height, W=self.frame_width, binary=False)
-            
+
             # Log every 10th image to avoid spam
             if self.image_count % 10 == 0:
-                self.get_logger().info(f"Processed {self.image_count} images. Current: {frame.shape[1]}x{frame.shape[0]} pixels")
+                self.get_logger().info(f"Processed {self.image_count} images at {self.target_fps} FPS target")
         except Exception as e:
             self.get_logger().error(f"Failed to convert image: {str(e)}")
+            self.is_processing = False
             return
 
         try:
+            t0 = time.time()
+
             # Pre-process the frame for model inference
             frame_tensor = PILImage.fromarray(frame)
             frame_tensor = self.image_transform(frame_tensor).to(self.device).unsqueeze(0)
+            t1 = time.time()
 
-            # Run inference
+            # Run AvoidNet inference
             outputs = self.model(frame_tensor)
             outputs = outputs.squeeze(0).detach().cpu().permute(1, 2, 0).numpy()
+            t2 = time.time()
 
-            # Dehaze processing
+            # Dehaze processing - boosts obstacle detection in turbid water
             atmospheric_light = self.dehazer.estimate_atmospheric_light(frame)
             color_difference_map = self.dehazer.get_color_difference_map(frame, atmospheric_light)
-            
-            # Resize color_difference_map to match outputs shape
             color_difference_map_resized = cv2.resize(color_difference_map, (outputs.shape[1], outputs.shape[0]))
             color_difference_map_resized *= self.color_diff_scale
-            
-            # Add color difference to model confidence
             outputs[:, :, 0] += color_difference_map_resized
             outputs = np.clip(outputs, 0, 1)
+            t3 = time.time()
 
             # Draw obstacles on frame
             frame = draw_red_squares(frame, outputs, self.threshold)
 
-            # Depth processing
+            # Depth processing (DepthAnything - heavy!)
             frame_rgb_pil = PILImage.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
             depth_pil = self.depth_processor.infer_pil(frame_rgb_pil)
             depth_np = np.array(depth_pil)
+            t4 = time.time()
+
+            # Log timing every 10 frames
+            if self.image_count % 10 == 0:
+                self.get_logger().info(f"Timing: preproc={1000*(t1-t0):.0f}ms, avoidnet={1000*(t2-t1):.0f}ms, dehaze={1000*(t3-t2):.0f}ms, depth={1000*(t4-t3):.0f}ms")
             
             # Normalize depth values to 0-1
             depth_np = (depth_np - np.nanmin(depth_np)) / (np.nanmax(depth_np) - np.nanmin(depth_np) + 1e-8)
@@ -155,88 +214,42 @@ class ImageProcessor(Node):
                 cv2.putText(frame, "Path Clear!", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
                 self.obstacle = 0
 
-            # Generate 3D visualization
-            plot_image = self._generate_3d_plot(frame, depth_np, outputs)
-            
-            # Publish the 3D plot as the processed image
-            processed_msg = self.bridge.cv2_to_imgmsg(plot_image, encoding='bgr8')
-            self.processed_image_publisher.publish(processed_msg)
+            # Publish annotated frame as compressed JPEG
+            stamp = self.get_clock().now().to_msg()
+            _, jpeg_data = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
+            frame_msg = CompressedImage()
+            frame_msg.header.stamp = stamp
+            frame_msg.format = 'jpeg'
+            frame_msg.data = jpeg_data.tobytes()
+            self.processed_image_publisher.publish(frame_msg)
+
+            # Publish depth map as grayscale image (normalized 0-255)
+            depth_uint8 = (depth_np * 255).astype(np.uint8)
+            depth_colored = cv2.applyColorMap(depth_uint8, cv2.COLORMAP_VIRIDIS)
+            _, depth_jpeg = cv2.imencode('.jpg', depth_colored, [cv2.IMWRITE_JPEG_QUALITY, 75])
+            depth_msg = CompressedImage()
+            depth_msg.header.stamp = stamp
+            depth_msg.format = 'jpeg'
+            depth_msg.data = depth_jpeg.tobytes()
+            self.depth_image_publisher.publish(depth_msg)
+
+            # Publish obstacle grid as heatmap
+            obstacle_heatmap = (outputs[:, :, 0] * 255).astype(np.uint8)
+            obstacle_resized = cv2.resize(obstacle_heatmap, (frame.shape[1], frame.shape[0]))
+            obstacle_colored = cv2.applyColorMap(obstacle_resized, cv2.COLORMAP_HOT)
+            _, obstacle_jpeg = cv2.imencode('.jpg', obstacle_colored, [cv2.IMWRITE_JPEG_QUALITY, 75])
+            obstacle_msg = CompressedImage()
+            obstacle_msg.header.stamp = stamp
+            obstacle_msg.format = 'jpeg'
+            obstacle_msg.data = obstacle_jpeg.tobytes()
+            self.obstacle_grid_publisher.publish(obstacle_msg)
 
         except Exception as e:
             self.get_logger().error(f"Error processing frame: {str(e)}")
             import traceback
             traceback.print_exc()
-
-    def _generate_3d_plot(self, frame, depth_np, outputs):
-        """Generate 3D visualization and convert to image array"""
-        try:
-            h, w = depth_np.shape
-            grid_h, grid_w = outputs.shape[:2]
-            cell_h, cell_w = h / grid_h, w / grid_w
-
-            # Clear previous plots
-            self.ax1.clear()
-            self.ax2.clear()
-            self.ax3.clear()
-
-            # Plotting for ax1 (Original Frame with Obstacles)
-            self.ax1.set_title("Original Frame with Obstacles")
-            self.ax1.imshow(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            self.ax1.axis('off')
-
-            # Plotting for ax2 (Depth Map 3D Surface)
-            self.ax2.set_title("Depth Map (3D Surface, Flipped)")
-            x, y = np.meshgrid(np.arange(w), np.arange(h))
-            self.ax2.plot_surface(x, y, depth_np, cmap='viridis', edgecolor='none', alpha=0.7)
-            self.ax2.set_xlabel("Width")
-            self.ax2.set_ylabel("Height")
-            self.ax2.set_zlabel("Depth")
-            self.ax2.view_init(elev=290, azim=-90)
-
-            # Plotting for ax3 (Obstacles 3D Scatter)
-            self.ax3.set_title("Obstacles (Red Squares, 3D, Flipped)")
-            xs, ys, zs = [], [], []
-            for i in range(grid_h):
-                for j in range(grid_w):
-                    if outputs[i, j, 0] > self.threshold:
-                        y1, y2 = int(i * cell_h), int((i + 1) * cell_h)
-                        x1, x2 = int(j * cell_w), int((j + 1) * cell_w)
-                        cell_depth = np.nanmean(depth_np[y1:y2, x1:x2])
-                        if not np.isnan(cell_depth):
-                            xs.append((x1 + x2) / 2)
-                            ys.append((y1 + y2) / 2)
-                            zs.append(cell_depth)
-            
-            if xs and ys and zs:  # Only plot if there are obstacles
-                self.ax3.scatter(xs, ys, zs, color='red', s=100, edgecolors='black')
-            
-            self.ax3.set_xlabel("Width")
-            self.ax3.set_ylabel("Height")
-            self.ax3.set_zlabel("Depth")
-            
-            # Set limits for consistent view
-            min_d, max_d = np.nanmin(depth_np), np.nanmax(depth_np)
-            self.ax3.set_xlim(0, w)
-            self.ax3.set_ylim(0, h)
-            self.ax3.set_zlim(min_d, max_d)
-            self.ax3.view_init(elev=290, azim=-90)
-
-            # Draw the figure and convert to image array
-            self.fig.canvas.draw()
-            img_array = np.frombuffer(self.fig.canvas.tostring_rgb(), dtype=np.uint8)
-            width, height = self.fig.canvas.get_width_height()
-            img_array = img_array.reshape(height, width, 3)
-            img_array_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
-
-            return img_array_bgr
-
-        except Exception as e:
-            self.get_logger().error(f"Error generating 3D plot: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            # Return a blank frame if plot generation fails
-            return np.zeros((480, 640, 3), dtype=np.uint8)
-
+        finally:
+            self.is_processing = False
 
     def joy_callback(self, msg):
         # Print the received joystick message
@@ -268,11 +281,12 @@ def main(args=None):
     node = ImageProcessor(
         arc="ImageReducer_bounded_grayscale",
         run_name="run_2_1",
-        use_gpu=False,
+        use_gpu=True,
         threshold=0.3,
         dehaze_t0=0.6,
         dehaze_atmos_factor=0.8,
-        color_diff_scale=0.4
+        color_diff_scale=0.4,
+        target_fps=30  # Testing with dehaze enabled
     )
     rclpy.spin(node)
     node.destroy_node()
