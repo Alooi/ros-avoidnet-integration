@@ -16,6 +16,7 @@ from image_processor_pkg.AvoidNet.avoid_net import get_model
 from image_processor_pkg.AvoidNet.dataset import SUIM_grayscale
 from image_processor_pkg.AvoidNet.draw_obsticle import draw_red_squares
 from image_processor_pkg.AvoidNet.trajectory import determain_trajectory
+from std_msgs.msg import Bool
 
 class ImageProcessor(Node):
     def __init__(self, arc, run_name, use_gpu=False, threshold=0.9, target_fps=5.0, enable_viz=False):
@@ -23,6 +24,9 @@ class ImageProcessor(Node):
         self.bridge = CvBridge()
         self.threshold = threshold
         self.enable_viz = enable_viz  # Disable heavy visualization by default
+
+        # AI processing is disabled until enabled via /ai_processing_enable
+        self.processing_enabled = False
 
         # Frame throttling - only process at target_fps to avoid CPU overload
         self.target_fps = target_fps
@@ -63,9 +67,24 @@ class ImageProcessor(Node):
         self.processed_image_publisher = self.create_publisher(
             CompressedImage, 'processed_image_topic', ai_qos)
 
+        # Subscribe to enable/disable control from NVR node (triggered by RViz AI Process button)
+        self.create_subscription(
+            Bool, '/ai_processing_enable', self.ai_enable_callback, 10)
+
         self.get_logger().info(f"Node initialized with model: {arc} on {self.device}, throttled to {target_fps} FPS")
+        self.get_logger().info("Waiting for /ai_processing_enable to start processing")
+
+    def ai_enable_callback(self, msg):
+        was_enabled = self.processing_enabled
+        self.processing_enabled = msg.data
+        if self.processing_enabled != was_enabled:
+            self.get_logger().info(f"AI processing {'enabled' if self.processing_enabled else 'disabled'}")
 
     def image_callback(self, msg):
+        # Skip if AI processing is not enabled
+        if not self.processing_enabled:
+            return
+
         # Throttle: skip frames if processing too fast or already processing
         current_time = time.time()
         if self.is_processing or (current_time - self.last_process_time) < self.min_interval:
