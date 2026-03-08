@@ -57,7 +57,7 @@ class ImageProcessor(Node):
         self.image_transform = SUIM_grayscale.get_transform()
 
         # Depth processing setup
-        self.depth_processor = DepthAnythingProcessor(encoder='vits', device=self.device)
+        self.depth_processor = DepthAnythingProcessor(encoder='vits', device=self.device, input_size=308)
         
         # Hazer depth model setup (will be initialized with first frame dimensions)
         self.hazer_model = None
@@ -77,9 +77,9 @@ class ImageProcessor(Node):
             depth=1
         )
         self.subscription = self.create_subscription(
-            Image, '/local/cam1/camera/image_raw_uncompressed', self.image_callback, qos_profile)
-        
-        self.get_logger().info("Subscribed to /local/cam1/camera/image_raw_uncompressed")
+            Image, '/local/cam1/camera/image_ai', self.image_callback, qos_profile)
+
+        self.get_logger().info("Subscribed to /local/cam1/camera/image_ai")
         
         self.subscription_joy = self.create_subscription(
             Joy, '/joy', self.joy_callback, 10)
