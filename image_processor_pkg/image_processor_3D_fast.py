@@ -138,6 +138,7 @@ class ImageProcessor(Node):
         try:
             # Convert ROS Image message to OpenCV format
             frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            original_frame = frame.copy()
             self.image_count += 1
 
             # Initialize hazer model on first frame
@@ -178,7 +179,7 @@ class ImageProcessor(Node):
             t3 = time.time()
 
             # Depth processing (DepthAnything - heavy!) — must run on clean frame BEFORE annotation
-            depth_np = self.depth_processor.infer_bgr(frame)  # H×W float32, metres
+            depth_np = self.depth_processor.infer_bgr(original_frame)  # H×W float32, metres
             # Smooth with bilateral filter to reduce noise while preserving edges
             depth_np = cv2.bilateralFilter(depth_np, d=9, sigmaColor=75, sigmaSpace=75)
             t4 = time.time()

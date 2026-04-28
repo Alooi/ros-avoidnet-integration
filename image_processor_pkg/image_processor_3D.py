@@ -137,6 +137,8 @@ class ImageProcessor(Node):
         try:
             # Convert ROS Image message to OpenCV format
             frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            original_frame = frame.copy()
+            self.image_count += 1
 
             # Initialize hazer model on first frame
             if self.hazer_model is None:
@@ -175,8 +177,8 @@ class ImageProcessor(Node):
             # Draw obstacles on frame
             frame = draw_red_squares(frame, outputs, self.threshold)
 
-            # Depth processing (DepthAnything - heavy!)
-            frame_rgb_pil = PILImage.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            # Depth processing (DepthAnything - heavy!) on the unannotated frame
+            frame_rgb_pil = PILImage.fromarray(cv2.cvtColor(original_frame, cv2.COLOR_BGR2RGB))
             depth_pil = self.depth_processor.infer_pil(frame_rgb_pil)
             depth_np = np.array(depth_pil)
             t4 = time.time()
