@@ -1,6 +1,5 @@
 
 import os
-import sys
 import torch
 import cv2
 import numpy as np
@@ -29,20 +28,14 @@ class DepthAnythingProcessor:
         self.max_depth = max_depth
 
         if metric:
-            metric_path = os.path.join(_BASE, 'Depth_Anything_V2', 'metric_depth')
-            if metric_path not in sys.path:
-                sys.path.insert(0, metric_path)
-            from depth_anything_v2.dpt import DepthAnythingV2 as _Model
+            from image_processor_pkg.AvoidNet3D.Depth_Anything_V2.metric_depth.depth_anything_v2.dpt import DepthAnythingV2 as _Model
             if checkpoint is None:
-                checkpoint = os.path.join(metric_path, 'checkpoints', f'{encoder}_metric.pth')
+                checkpoint = os.path.join(_BASE, 'Depth_Anything_V2', 'metric_depth', 'checkpoints', f'{encoder}_metric.pth')
             model_kwargs = {**MODEL_CONFIGS[encoder], 'max_depth': max_depth}
         else:
-            da2_path = os.path.join(_BASE, 'Depth_Anything_V2')
-            if da2_path not in sys.path:
-                sys.path.insert(0, da2_path)
-            from depth_anything_v2.dpt import DepthAnythingV2 as _Model
+            from image_processor_pkg.AvoidNet3D.Depth_Anything_V2.depth_anything_v2.dpt import DepthAnythingV2 as _Model
             if checkpoint is None:
-                checkpoint = os.path.join(da2_path, 'checkpoints', f'{encoder}.pth')
+                checkpoint = os.path.join(_BASE, 'Depth_Anything_V2', 'checkpoints', f'{encoder}.pth')
             model_kwargs = MODEL_CONFIGS[encoder]
 
         self.model = _Model(**model_kwargs)

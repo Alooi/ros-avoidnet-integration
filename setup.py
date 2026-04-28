@@ -16,6 +16,12 @@ setup(
         ]),
     ],
     install_requires=['setuptools', 'torch', 'torchvision', 'opencv-python', 'Pillow', 'numpy', 'matplotlib', 'huggingface-hub'],
+    package_data={
+        'image_processor_pkg': [
+            'AvoidNet3D/Depth_Anything_V2/checkpoints/*.pth',
+            'AvoidNet3D/Depth_Anything_V2/metric_depth/checkpoints/*.pth',
+        ],
+    },
     zip_safe=True,
     maintainer='your_name',
     maintainer_email='your_email@example.com',

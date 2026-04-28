@@ -1,8 +1,8 @@
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
-from sensor_msgs.msg import CompressedImage, Image, Joy
 from std_msgs.msg import Bool
+from sensor_msgs.msg import CompressedImage, Image, Joy
 import cv2
 import numpy as np
 import torch
@@ -21,6 +21,7 @@ from image_processor_pkg.AvoidNet.trajectory import determain_trajectory
 from image_processor_pkg.AvoidNet3D.hazer_depth_class import HazerDepth
 from image_processor_pkg.AvoidNet3D.dehaze_class import DehazeClass
 from image_processor_pkg.AvoidNet3D.depth_anything_processor import DepthAnythingProcessor
+from std_msgs.msg import Bool
 
 class ImageProcessor(Node):
     def __init__(self, arc, run_name, use_gpu=False, threshold=0.5, dehaze_t0=0.6, dehaze_atmos_factor=0.8, color_diff_scale=0.5,
@@ -30,7 +31,7 @@ class ImageProcessor(Node):
         self.threshold = threshold
         self.obstacle = 0
 
-        # Processing gate - starts disabled, enabled via /ai_processing_enable from surface laptop
+        # AI processing is disabled until enabled via /ai_processing_enable
         self.processing_enabled = False
 
         # Frame throttling - critical for preventing system overload
@@ -56,7 +57,7 @@ class ImageProcessor(Node):
         self.image_transform = SUIM_grayscale.get_transform()
 
         # Depth processing setup
-        self.depth_processor = DepthAnythingProcessor(encoder='vits', device=self.device)
+        self.depth_processor = DepthAnythingProcessor(encoder='vits', device=self.device, input_size=308)
         
         # Hazer depth model setup (will be initialized with first frame dimensions)
         self.hazer_model = None
@@ -76,20 +77,16 @@ class ImageProcessor(Node):
             depth=1
         )
         self.subscription = self.create_subscription(
-            Image, '/local/cam1/camera/image_raw_uncompressed', self.image_callback, qos_profile)
-        
-        self.get_logger().info("Subscribed to /local/cam1/camera/image_raw_uncompressed")
-        
-        # Add a counter to track received images
-        self.image_count = 0
-        
-        # Subscribe to AI processing enable/disable from surface laptop (via NVR service)
-        self.create_subscription(
-            Bool, '/ai_processing_enable', self.ai_enable_callback, 10)
-        self.get_logger().info("Waiting for AI processing enable signal on /ai_processing_enable")
+            Image, '/local/cam1/camera/image_ai', self.image_callback, qos_profile)
 
+        self.get_logger().info("Subscribed to /local/cam1/camera/image_ai")
+        
         self.subscription_joy = self.create_subscription(
             Joy, '/joy', self.joy_callback, 10)
+
+        # Subscribe to AI processing enable/disable from surface laptop / NVR node
+        self.ai_enable_sub = self.create_subscription(
+            Bool, '/ai_processing_enable', self.ai_enable_callback, 10)
 
         # Publisher for the processed image (use BestEffort QoS for RViz compatibility)
         processed_image_qos = QoSProfile(
@@ -112,21 +109,23 @@ class ImageProcessor(Node):
 
         self.joy_manipulation = self.create_publisher(Joy, '/joy', 80)
 
-        
+        # Subscribe to enable/disable control from NVR node (triggered by RViz AI Process button)
+        self.create_subscription(
+            Bool, '/ai_processing_enable', self.ai_enable_callback, 10)
+
         self.get_logger().info(f"Node initialized with model: {arc} on {self.device} - 3D version with depth processing")
+        self.get_logger().info("Waiting for /ai_processing_enable to start processing")
 
     def ai_enable_callback(self, msg):
         was_enabled = self.processing_enabled
         self.processing_enabled = msg.data
-        if self.processing_enabled and not was_enabled:
-            self.get_logger().info("AI processing ENABLED")
-        elif not self.processing_enabled and was_enabled:
-            self.get_logger().info("AI processing DISABLED")
+        if self.processing_enabled != was_enabled:
+            self.get_logger().info(f"AI processing {'enabled' if self.processing_enabled else 'disabled'}")
 
     def image_callback(self, msg):
+        # Skip if AI processing is not enabled
         if not self.processing_enabled:
             return
-
         # Throttle: skip frames if processing too fast or already processing
         current_time = time.time()
         if self.is_processing or (current_time - self.last_process_time) < self.min_interval:
@@ -148,9 +147,6 @@ class ImageProcessor(Node):
                 self.hazer_model = HazerDepth(show_video=False, show_graph=False, patch_size=1,
                                             H=self.frame_height, W=self.frame_width, binary=False)
 
-            # Log every 10th image to avoid spam
-            if self.image_count % 10 == 0:
-                self.get_logger().info(f"Processed {self.image_count} images at {self.target_fps} FPS target")
         except Exception as e:
             self.get_logger().error(f"Failed to convert image: {str(e)}")
             self.is_processing = False
@@ -169,7 +165,7 @@ class ImageProcessor(Node):
             outputs = outputs.squeeze(0).detach().cpu().permute(1, 2, 0).numpy()
             t2 = time.time()
 
-            # Dehaze processing - boosts obstacle detection in turbid water
+            # Dehaze processing
             atmospheric_light = self.dehazer.estimate_atmospheric_light(frame)
             color_difference_map = self.dehazer.get_color_difference_map(frame, atmospheric_light)
             color_difference_map_resized = cv2.resize(color_difference_map, (outputs.shape[1], outputs.shape[0]))
@@ -187,10 +183,6 @@ class ImageProcessor(Node):
             depth_np = np.array(depth_pil)
             t4 = time.time()
 
-            # Log timing every 10 frames
-            if self.image_count % 10 == 0:
-                self.get_logger().info(f"Timing: preproc={1000*(t1-t0):.0f}ms, avoidnet={1000*(t2-t1):.0f}ms, dehaze={1000*(t3-t2):.0f}ms, depth={1000*(t4-t3):.0f}ms")
-            
             # Normalize depth values to 0-1
             depth_np = (depth_np - np.nanmin(depth_np)) / (np.nanmax(depth_np) - np.nanmin(depth_np) + 1e-8)
             depth_np = 1 - depth_np  # Invert for visualization
@@ -253,8 +245,7 @@ class ImageProcessor(Node):
             self.is_processing = False
 
     def joy_callback(self, msg):
-        # Print the received joystick message
-        print(msg)
+        pass
 
         # # Check if button 4 is pressed (indexing starts at 0)
         # if len(msg.buttons) > 4 and msg.buttons[4]:
@@ -287,7 +278,7 @@ def main(args=None):
         dehaze_t0=0.6,
         dehaze_atmos_factor=0.8,
         color_diff_scale=0.4,
-        target_fps=30  # Testing with dehaze enabled
+        target_fps=15.0  # Testing without dehaze
     )
     rclpy.spin(node)
     node.destroy_node()
